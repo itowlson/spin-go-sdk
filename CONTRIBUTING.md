@@ -5,6 +5,7 @@ Whenever WIT files are changed, added to, or removed from the `wit` directory, t
 ### Prerequisites
 
 - BASH or compatible shell
+- `componentize-go` from https://github.com/bytecodealliance/componentize-go
 
 ### Run
 ```sh
