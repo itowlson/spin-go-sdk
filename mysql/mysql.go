@@ -9,9 +9,9 @@ import (
 	"io"
 	"reflect"
 
+	mysql "github.com/spinframework/spin-go-sdk/v3/imports/spin_mysql_3_0_0_mysql"
 	spindb "github.com/spinframework/spin-go-sdk/v3/internal/db"
-	mysql "github.com/spinframework/spin-go-sdk/v3/imports/fermyon_spin_2_0_0_mysql"
-	rdbmstypes "github.com/spinframework/spin-go-sdk/v3/imports/fermyon_spin_2_0_0_rdbms_types"
+	wittypes "go.bytecodealliance.org/pkg/wit/types"
 )
 
 // Open returns a new connection to the database.
@@ -39,6 +39,8 @@ type connector struct {
 	conn *conn
 	name string
 }
+
+var _ driver.Conn = (*conn)(nil)
 
 func (d *connector) Connect(_ context.Context) (driver.Conn, error) {
 	if d.conn != nil {
@@ -70,10 +72,10 @@ func (d *connector) Close() error {
 type rows struct {
 	columns    []string
 	columnType []uint8
-	pos        int
-	len        int
-	rows       [][]any
-	closed     bool
+	next       []any
+	stream     *wittypes.StreamReader[[]mysql.DbValue]
+	future     *wittypes.FutureReader[wittypes.Result[wittypes.Unit, mysql.Error]]
+	result     error
 }
 
 var _ driver.Rows = (*rows)(nil)
@@ -87,29 +89,46 @@ func (r *rows) Columns() []string {
 
 // Close closes the rows iterator.
 func (r *rows) Close() error {
-	r.rows = nil
-	r.pos = 0
-	r.len = 0
-	r.closed = true
+	r.stream.Drop()
+	r.future.Drop()
+	r.stream = nil
+	r.future = nil
+	r.next = nil
+	r.result = io.EOF
+	return nil
+}
+
+func (r *rows) pull() []any {
+	buffer := [][]mysql.DbValue{nil}
+	if r.stream.Read(buffer) == 1 {
+		return toRow(buffer[0])
+	}
+	result := r.future.Read()
+	if result.IsOk() {
+		r.result = io.EOF
+	} else {
+		r.result = toError(result.Err())
+	}
 	return nil
 }
 
 // Next moves the cursor to the next row.
 func (r *rows) Next(dest []driver.Value) error {
 	if !r.HasNextResultSet() {
-		return io.EOF
+		return r.result
 	}
+	next := r.next
+	r.next = r.pull()
 	for i := 0; i != len(r.columns); i++ {
-		dest[i] = driver.Value(r.rows[r.pos][i])
+		dest[i] = driver.Value(next[i])
 	}
-	r.pos++
 	return nil
 }
 
 // HasNextResultSet is called at the end of the current result set and
 // reports whether there is another result set after the current one.
 func (r *rows) HasNextResultSet() bool {
-	return r.pos < r.len
+	return r.next != nil
 }
 
 // NextResultSet advances the driver to the next result set even
@@ -118,10 +137,10 @@ func (r *rows) HasNextResultSet() bool {
 // NextResultSet should return io.EOF when there are no more result sets.
 func (r *rows) NextResultSet() error {
 	if r.HasNextResultSet() {
-		r.pos++
+		r.next = r.pull()
 		return nil
 	}
-	return io.EOF // Per interface spec.
+	return r.result
 }
 
 // ColumnTypeScanType returns the value type that can be used to scan types into.
@@ -176,13 +195,8 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 		return nil, toError(results.Err())
 	}
 
-	rowLen := len(results.Ok().Rows)
-	allRows := make([][]any, rowLen)
-	for rowNum, row := range results.Ok().Rows {
-		allRows[rowNum] = toRow(row)
-	}
-
-	cols := results.Ok().Columns
+	tuple := results.Ok()
+	cols := tuple.F0
 	colNames := make([]string, len(cols))
 	colTypes := make([]uint8, len(cols))
 	for i, c := range cols {
@@ -193,44 +207,46 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	rows := &rows{
 		columns:    colNames,
 		columnType: colTypes,
-		rows:       allRows,
-		len:        int(rowLen),
+		stream:     tuple.F1,
+		future:     tuple.F2,
 	}
+
+	rows.next = rows.pull()
 	return rows, nil
 }
 
 func toWasiParameterValue(x any) mysql.ParameterValue {
 	switch v := x.(type) {
 	case bool:
-		return rdbmstypes.MakeParameterValueBoolean(v)
+		return mysql.MakeParameterValueBoolean(v)
 	case int8:
-		return rdbmstypes.MakeParameterValueInt8(v)
+		return mysql.MakeParameterValueInt8(v)
 	case int16:
-		return rdbmstypes.MakeParameterValueInt16(v)
+		return mysql.MakeParameterValueInt16(v)
 	case int32:
-		return rdbmstypes.MakeParameterValueInt32(v)
+		return mysql.MakeParameterValueInt32(v)
 	case int64:
-		return rdbmstypes.MakeParameterValueInt64(v)
+		return mysql.MakeParameterValueInt64(v)
 	case int:
-		return rdbmstypes.MakeParameterValueInt64(int64(v))
+		return mysql.MakeParameterValueInt64(int64(v))
 	case uint8:
-		return rdbmstypes.MakeParameterValueUint8(v)
+		return mysql.MakeParameterValueUint8(v)
 	case uint16:
-		return rdbmstypes.MakeParameterValueUint16(v)
+		return mysql.MakeParameterValueUint16(v)
 	case uint32:
-		return rdbmstypes.MakeParameterValueUint32(v)
+		return mysql.MakeParameterValueUint32(v)
 	case uint64:
-		return rdbmstypes.MakeParameterValueUint64(v)
+		return mysql.MakeParameterValueUint64(v)
 	case float32:
-		return rdbmstypes.MakeParameterValueFloating32(v)
+		return mysql.MakeParameterValueFloating32(v)
 	case float64:
-		return rdbmstypes.MakeParameterValueFloating64(v)
+		return mysql.MakeParameterValueFloating64(v)
 	case string:
-		return rdbmstypes.MakeParameterValueStr(v)
+		return mysql.MakeParameterValueStr(v)
 	case []byte:
-		return rdbmstypes.MakeParameterValueBinary(v)
+		return mysql.MakeParameterValueBinary(v)
 	case nil:
-		return rdbmstypes.MakeParameterValueDbNull()
+		return mysql.MakeParameterValueDbNull()
 	default:
 		panic("unknown value type")
 	}
@@ -238,13 +254,13 @@ func toWasiParameterValue(x any) mysql.ParameterValue {
 
 func toError(err mysql.Error) error {
 	switch err.Tag() {
-	case rdbmstypes.ErrorBadParameter:
+	case mysql.ErrorBadParameter:
 		return errors.New(err.BadParameter())
-	case rdbmstypes.ErrorConnectionFailed:
+	case mysql.ErrorConnectionFailed:
 		return errors.New(err.ConnectionFailed())
-	case rdbmstypes.ErrorQueryFailed:
+	case mysql.ErrorQueryFailed:
 		return errors.New(err.QueryFailed())
-	case rdbmstypes.ErrorValueConversionFailed:
+	case mysql.ErrorValueConversionFailed:
 		return errors.New(err.ValueConversionFailed())
 	default:
 		// TODO: not sure if using "Other" as the default is appropriate
@@ -252,37 +268,37 @@ func toError(err mysql.Error) error {
 	}
 }
 
-func toRow(row []rdbmstypes.DbValue) []any {
+func toRow(row []mysql.DbValue) []any {
 	result := make([]any, len(row))
 	for i, v := range row {
 		switch v.Tag() {
-		case rdbmstypes.DbValueBoolean:
+		case mysql.DbValueBoolean:
 			result[i] = v.Boolean()
-		case rdbmstypes.DbValueInt8:
+		case mysql.DbValueInt8:
 			result[i] = v.Int8()
-		case rdbmstypes.DbValueInt16:
+		case mysql.DbValueInt16:
 			result[i] = v.Int16()
-		case rdbmstypes.DbValueInt32:
+		case mysql.DbValueInt32:
 			result[i] = v.Int32()
-		case rdbmstypes.DbValueInt64:
+		case mysql.DbValueInt64:
 			result[i] = v.Int64()
-		case rdbmstypes.DbValueUint8:
+		case mysql.DbValueUint8:
 			result[i] = v.Uint8()
-		case rdbmstypes.DbValueUint16:
+		case mysql.DbValueUint16:
 			result[i] = v.Uint16()
-		case rdbmstypes.DbValueUint32:
+		case mysql.DbValueUint32:
 			result[i] = v.Uint32()
-		case rdbmstypes.DbValueUint64:
+		case mysql.DbValueUint64:
 			result[i] = v.Uint64()
-		case rdbmstypes.DbValueFloating32:
+		case mysql.DbValueFloating32:
 			result[i] = v.Floating32()
-		case rdbmstypes.DbValueFloating64:
+		case mysql.DbValueFloating64:
 			result[i] = v.Floating64()
-		case rdbmstypes.DbValueStr:
+		case mysql.DbValueStr:
 			result[i] = v.Str()
-		case rdbmstypes.DbValueBinary:
+		case mysql.DbValueBinary:
 			result[i] = v.Binary()
-		case rdbmstypes.DbValueDbNull:
+		case mysql.DbValueDbNull:
 			result[i] = nil
 		default:
 			panic("unknown value type")
@@ -309,29 +325,29 @@ func (r result) RowsAffected() (int64, error) {
 
 func colTypeToReflectType(typ uint8) reflect.Type {
 	switch typ {
-	case uint8(rdbmstypes.DbDataTypeBoolean):
+	case uint8(mysql.DbDataTypeBoolean):
 		return reflect.TypeOf(false)
-	case uint8(rdbmstypes.DbDataTypeInt8):
+	case uint8(mysql.DbDataTypeInt8):
 		return reflect.TypeOf(int8(0))
-	case uint8(rdbmstypes.DbDataTypeInt16):
+	case uint8(mysql.DbDataTypeInt16):
 		return reflect.TypeOf(int16(0))
-	case uint8(rdbmstypes.DbDataTypeInt32):
+	case uint8(mysql.DbDataTypeInt32):
 		return reflect.TypeOf(int32(0))
-	case uint8(rdbmstypes.DbDataTypeInt64):
+	case uint8(mysql.DbDataTypeInt64):
 		return reflect.TypeOf(int64(0))
-	case uint8(rdbmstypes.DbDataTypeUint8):
+	case uint8(mysql.DbDataTypeUint8):
 		return reflect.TypeOf(uint8(0))
-	case uint8(rdbmstypes.DbDataTypeUint16):
+	case uint8(mysql.DbDataTypeUint16):
 		return reflect.TypeOf(uint16(0))
-	case uint8(rdbmstypes.DbDataTypeUint32):
+	case uint8(mysql.DbDataTypeUint32):
 		return reflect.TypeOf(uint32(0))
-	case uint8(rdbmstypes.DbDataTypeUint64):
+	case uint8(mysql.DbDataTypeUint64):
 		return reflect.TypeOf(uint64(0))
-	case uint8(rdbmstypes.DbDataTypeStr):
+	case uint8(mysql.DbDataTypeStr):
 		return reflect.TypeOf("")
-	case uint8(rdbmstypes.DbDataTypeBinary):
+	case uint8(mysql.DbDataTypeBinary):
 		return reflect.TypeOf(new([]byte))
-	case uint8(rdbmstypes.DbDataTypeOther):
+	case uint8(mysql.DbDataTypeOther):
 		return reflect.TypeOf(new(any)).Elem()
 	}
 	panic("invalid db column type of " + string(typ))
