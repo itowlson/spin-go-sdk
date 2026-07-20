@@ -11,3 +11,11 @@ Whenever WIT files are changed, added to, or removed from the `wit` directory, t
 ```sh
 bash regenerate-bindings.sh
 ```
+
+## Running `go mod tidy` on all modules
+
+This will run `go mod tidy` on the root module and all the examples and tests:
+
+```sh
+bash tidy.sh
+```
