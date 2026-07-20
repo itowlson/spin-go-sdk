@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/stretchr/testify v1.11.1
-	go.bytecodealliance.org/pkg v0.2.2
+	go.bytecodealliance.org/pkg v0.2.3
 )
 
 require (
